@@ -1,0 +1,22 @@
+n2cal:
+    data_dir: "/mnt/gong/archive"
+    acq:
+        - "20180921T004045Z_chimeN2_corr"
+    output_dir: "/mnt/gong/ssiegel/jumps"
+    output_suffix: "jumps_threshold_50"
+    niceness: 10
+    time_start:
+    time_stop:
+    freq_start:
+    freq_stop:
+    wavelet_name: 'gaus5'
+    thresh: 0.5
+    search_span: 0.5
+    psigma_max: 20.0
+    min_scale: 31
+    max_scale: 201
+    min_rise: 31
+    log_scale: False
+    num_points: 100
+    use_input_flag: False
+    input_threshold: 0.70
