@@ -1,14 +1,20 @@
-n2cal:
-    data_dir: "/mnt/gong/archive"
+findjump:
+    data_dir: "/mnt/gong/not_archived"
     acq:
-        - "20180921T004045Z_chimeN2_corr"
+        - "20181212T234136Z_chimecal_corr"
+        - "20181220T235142Z_chimecal_corr"
     output_dir: "/mnt/gong/ssiegel/jumps"
-    output_suffix: "jumps_threshold_50"
+    output_suffix: "jumps50"
+    max_num_file: 20
     niceness: 10
     time_start:
     time_stop:
-    freq_start:
-    freq_stop:
+    freq_physical:
+        - 665.625
+    freq_start: 1
+    freq_stop: 2
+    ignore_sun: True
+    only_quiet: False
     wavelet_name: 'gaus5'
     thresh: 0.5
     search_span: 0.5

@@ -5,12 +5,14 @@ import pickle
 import argparse
 import time
 import datetime
+import gc
 
 import numpy as np
 import h5py
 import pywt
 
 from pychfpga import NameSpace, load_yaml_config
+from calibration import utils
 
 import log
 
@@ -47,6 +49,44 @@ DEFAULT_LOGGING = {
 ###################################################
 # auxiliary routines
 ###################################################
+
+def daytime_flag(time):
+
+    flag = np.zeros(time.size, dtype=np.bool)
+    rise = ephemeris.solar_rising(time[0] - 24.0 * 3600.0, end_time=time[-1])
+    for rr in rise:
+        ss = ephemeris.solar_setting(rr)[0]
+        flag |= ((time >= rr) & (time <= ss))
+
+    return flag
+
+def transit_flag(name, time, nsig=1.0, freq=400.0, pol='X'):
+
+    flag = np.zeros(time.size, dtype=np.bool)
+
+    if name.lower() == 'sun':
+
+        window_sec = nsig * utils.get_window(freq, pol=pol, dec=np.radians(23.45), deg=False)
+
+        ttrans = ephemeris.solar_transit(time[0] - 24.0 * 3600.0, time[-1] + 24.0 * 3600.0)
+
+    else:
+
+        src = FluxCatalog[name].skyfield
+
+        window_sec = nsig * utils.get_window(freq, pol=pol, dec=np.radians(FluxCatalog[name].dec), deg=False)
+
+        ttrans = ephemeris.transit_times(src, time[0] - 24.0 * 3600.0, time[-1] + 24.0 * 3600.0)
+
+    for tt in ttrans:
+
+        # Flag +/- window_sec around peak location
+        begin = tt - window_sec
+        end = tt + window_sec
+        flag |= ((time >= begin) & (time <= end))
+
+    return flag
+
 
 def sliding_window(arr, window):
 
@@ -169,6 +209,11 @@ def finger_finder(scale, flag, mod_max, istart=3, do_fill=False):
     return candidates, cmm, pdrift, start, stop, lbl
 
 
+def chunks(l, n):
+    """Yield successive n-sized chunks from l."""
+    for i in range(0, len(l), n):
+        yield l[i:i + n]
+
 ###################################################
 # main routine
 ###################################################
@@ -208,50 +253,27 @@ def main(config_file=None, logging_params=DEFAULT_LOGGING):
     for acq in config.acq:
 
         # Find acquisition files
-        data_files = sorted(glob(os.path.join(config.data_dir, acq, "*.h5")))
-        nfiles = len(data_files)
+        all_data_files = sorted(glob(os.path.join(config.data_dir, acq, "*.h5")))
+        nfiles = len(all_data_files)
 
         if nfiles == 0:
             continue
 
         mlog.info("Now processing acquisition %s (%d files)" % (acq, nfiles))
 
-        # Deteremine selections along the various axes
-        rdr = andata.CorrData.from_acq_h5(data_files, datasets=())
+        # Determine list of feeds to examine
+        dset = ['flags/inputs'] if config.use_input_flag else ()
 
-        auto_sel = np.array([ii for ii, pp in enumerate(rdr.prod) if pp[0] == pp[1]])
+        rdr = andata.CorrData.from_acq_h5(all_data_files, datasets=dset,
+                                          apply_gain=False, renormalize=False)
 
-        if config.time_start is None:
-            ind_start = 0
-        else:
-            time_start = ephemeris.datetime_to_unix(datetime.datetime(*config.time_start))
-            ind_start = int(np.argmin(np.abs(rdr.time - time_start)))
-
-        if config.time_stop is None:
-            ind_stop = rdr.ntime
-        else:
-            time_stop = ephemeris.datetime_to_unix(datetime.datetime(*config.time_stop))
-            ind_stop = int(np.argmin(np.abs(rdr.time - time_stop)))
-
-        fstart = config.freq_start if config.freq_start is not None else 0
-        fstop = config.freq_stop if config.freq_stop is not None else rdr.freq.size
-        freq_sel = slice(fstart, fstop)
-
-        # Load autocorrelations
-        t0 = time.time()
-        data = andata.CorrData.from_acq_h5(data_files, datasets=['vis'], start=ind_start, stop=ind_stop,
-                                                       freq_sel=freq_sel, prod_sel=auto_sel,
-                                                       apply_gain=False, renormalize=False)
-
-        mlog.info("Took %0.1f seconds to load autocorrelations." % (time.time() - t0,))
-
-        inputmap = tools.get_correlator_inputs(ephemeris.unix_to_datetime(data.time[0]),
+        inputmap = tools.get_correlator_inputs(ephemeris.unix_to_datetime(rdr.time[0]),
                                                correlator='chime')
 
         # Extract good inputs
         if config.use_input_flag:
-            ifeed = np.flatnonzero((np.sum(data.flags['inputs'][:], axis=-1, dtype=np.int) /
-                                 float(data.flags['inputs'].shape[-1])) > config.input_threshold)
+            ifeed = np.flatnonzero((np.sum(rdr.flags['inputs'][:], axis=-1, dtype=np.int) /
+                                     float(rdr.flags['inputs'].shape[-1])) > config.input_threshold)
         else:
             ifeed = np.array([ii for ii, inp in enumerate(inputmap) if tools.is_chime(inp)])
 
@@ -264,130 +286,213 @@ def main(config_file=None, logging_params=DEFAULT_LOGGING):
         jump_flag, jump_time, jump_auto = [], [], []
         ncandidate = 0
 
-        # Loop over frequencies
-        for ff, freq in enumerate(data.freq):
+        # Determine number of files to process at once
+        if config.max_num_file is None:
+            chunk_size = nfiles
+        else:
+            chunk_size = min(config.max_num_file, nfiles)
 
-            mlog.info("FREQ %d (%0.2f MHz)" % (ff, freq))
+        # Loop over chunks of files
+        for chnk, data_files in enumerate(chunks(all_data_files, chunk_size)):
 
-            auto = data.vis[ff, :, :].real
+            mlog.info("Now processing chunk %d (%d files)" % (chnk, len(data_files)))
 
-            fractional_auto = auto * tools.invert_no_zero(np.median(auto, axis=-1, keepdims=True)) - 1.0
+            # Deteremine selections along the various axes
+            rdr = andata.CorrData.from_acq_h5(data_files, datasets=())
 
-            # Loop over inputs
-            for ii in ifeed:
+            auto_sel = np.array([ii for ii, pp in enumerate(rdr.prod) if pp[0] == pp[1]])
+            auto_sel = andata._convert_to_slice(auto_sel)
 
-                t0 = time.time()
+            if config.time_start is None:
+                ind_start = 0
+            else:
+                time_start = ephemeris.datetime_to_unix(datetime.datetime(*config.time_start))
+                ind_start = int(np.argmin(np.abs(rdr.time - time_start)))
 
-                mlog.info("INPUT %d" % ii)
+            if config.time_stop is None:
+                ind_stop = rdr.ntime
+            else:
+                time_stop = ephemeris.datetime_to_unix(datetime.datetime(*config.time_stop))
+                ind_stop = int(np.argmin(np.abs(rdr.time - time_stop)))
 
-                signal = fractional_auto[ii, :]
+            if config.freq_physical is not None:
 
-                # Perform wavelet transform
-                coef, freqs = pywt.cwt(signal, scale, config.wavelet_name)
+                if hasattr(config.freq_physical, '__iter__'):
+                    freq_physical = config.freq_physical
+                else:
+                    freq_physical = [config.freq_physical]
 
-                mlog.info("Took %0.1f seconds to perform wavelet transform." % (time.time() - t0,))
-                t0 = time.time()
+                freq_sel = [np.argmin(np.abs(ff - rdr.freq)) for ff in freq_physical]
+                freq_sel = andata._convert_to_slice(freq_sel)
 
-                # Find local modulus maxima
-                flg_mod_max, mod_max = mod_max_finder(scale, coef, threshold=config.thresh, search_span=config.search_span)
+            else:
+                fstart = config.freq_start if config.freq_start is not None else 0
+                fstop = config.freq_stop if config.freq_stop is not None else rdr.freq.size
+                freq_sel = slice(fstart, fstop)
 
-                mlog.info("Took %0.1f seconds to find modulus maxima." % (time.time() - t0,))
-                t0 = time.time()
+            # Load autocorrelations
+            t0 = time.time()
+            data = andata.CorrData.from_acq_h5(data_files, datasets=['vis'], start=ind_start, stop=ind_stop,
+                                                           freq_sel=freq_sel, prod_sel=auto_sel,
+                                                           apply_gain=False, renormalize=False)
 
-                # Find persisent modulus maxima across scales
-                candidates, cmm, pdrift, start, stop, lbl = finger_finder(scale, flg_mod_max, mod_max,
-                                                                          istart=max(config.min_rise - config.min_scale, 0),
-                                                                          do_fill=False)
+            mlog.info("Took %0.1f seconds to load autocorrelations." % (time.time() - t0,))
 
-                mlog.info("Took %0.1f seconds to find fingers." % (time.time() - t0,))
-                t0 = time.time()
+            # If first chunk, save the frequencies that are being used
+            if not chnk:
+                all_freq = data.freq.copy()
 
-                if candidates is None:
-                    continue
+            # If requested do not consider data during day or near bright source transits
+            flag_quiet = np.ones(data.ntime, dtype=np.bool)
+            if config.ignore_sun:
+                flag_quiet &= ~transit_flag('sun', data.time, freq=np.min(data.freq), pol='X', nsig=1.0)
 
-                # Cut bad candidates
-                index_good_candidates = np.flatnonzero((scale[stop] >= config.max_scale) &
-                                                        flag_quiet[candidates[start, np.arange(start.size)]] &
-                                                        (pdrift <= config.psigma_max))
+            if config.only_quiet:
+                flag_quiet &= ~daytime_flag(data.time)
+                for ss in ["CYG_A", "CAS_A", "TAU_A", "VIR_A"]:
+                    flag_quiet &= ~transit_flag(ss, data.time, freq=np.min(data.freq), pol='X', nsig=1.0)
 
-                ngood = index_good_candidates.size
+            # Loop over frequencies
+            for ff, freq in enumerate(data.freq):
 
-                if ngood == 0:
-                    mlog.info("No jumps")
-                    continue
+                print_cnt = 0
+                mlog.info("FREQ %d (%0.2f MHz)" % (ff, freq))
 
-                mlog.info("%d jumps" % ngood)
+                auto = data.vis[ff, :, :].real
 
-                # Add remaining candidates to list
-                ncandidate += ngood
+                fractional_auto = auto * tools.invert_no_zero(np.median(auto, axis=-1, keepdims=True)) - 1.0
 
-                cfreq += [freq] * ngood
-                cinput += [ii] * ngood
+                # Loop over inputs
+                for ii in ifeed:
 
-                for igc in index_good_candidates:
+                    print_cnt += 1
+                    do_print = not (print_cnt % 100)
 
-                    icenter = candidates[start[igc], igc]
+                    if do_print:
+                        mlog.info("INPUT %d" % ii)
+                    t0 = time.time()
 
-                    cindex.append(icenter)
-                    ctime.append(timestamp[icenter])
+                    signal = fractional_auto[ii, :]
 
-                    aa = max(0, icenter - nhwin)
-                    bb = min(ntime, icenter + nhwin + 1)
+                    # Perform wavelet transform
+                    coef, freqs = pywt.cwt(signal, scale, config.wavelet_name)
 
-                    ncut = bb - aa
+                    if do_print:
+                        mlog.info("Took %0.1f seconds to perform wavelet transform." % (time.time() - t0,))
+                    t0 = time.time()
 
-                    temp_var = np.zeros(nwin, dtype=np.bool)
-                    temp_var[0:ncut] = True
-                    jump_flag.append(temp_var)
+                    # Find local modulus maxima
+                    flg_mod_max, mod_max = mod_max_finder(scale, coef, threshold=config.thresh, search_span=config.search_span)
 
-                    temp_var = np.zeros(nwin, dtype=timestamp.dtype)
-                    temp_var[0:ncut] = timestamp[aa:bb]
-                    jump_time.append(temp_var)
+                    if do_print:
+                        mlog.info("Took %0.1f seconds to find modulus maxima." % (time.time() - t0,))
+                    t0 = time.time()
 
-                    temp_var = np.zeros(nwin, dtype=auto.dtype)
-                    temp_var[0:ncut] = auto[ii, aa:bb]
-                    jump_auto.append(temp_var)
+                    # Find persisent modulus maxima across scales
+                    candidates, cmm, pdrift, start, stop, lbl = finger_finder(scale, flg_mod_max, mod_max,
+                                                                              istart=max(config.min_rise - config.min_scale, 0),
+                                                                              do_fill=False)
+
+                    if do_print:
+                        mlog.info("Took %0.1f seconds to find fingers." % (time.time() - t0,))
+                    t0 = time.time()
+
+                    if candidates is None:
+                        continue
+
+                    # Cut bad candidates
+                    index_good_candidates = np.flatnonzero((scale[stop] >= config.max_scale) &
+                                                            flag_quiet[candidates[start, np.arange(start.size)]] &
+                                                            (pdrift <= config.psigma_max))
+
+                    ngood = index_good_candidates.size
+
+                    if ngood == 0:
+                        continue
+
+                    mlog.info("Input %d has %d jumps" % (ii, ngood))
+
+                    # Add remaining candidates to list
+                    ncandidate += ngood
+
+                    cfreq += [freq] * ngood
+                    cinput += [ii] * ngood
+
+                    for igc in index_good_candidates:
+
+                        icenter = candidates[start[igc], igc]
+
+                        cindex.append(icenter)
+                        ctime.append(data.time[icenter])
+
+                        aa = max(0, icenter - nhwin)
+                        bb = min(data.ntime, icenter + nhwin + 1)
+
+                        ncut = bb - aa
+
+                        temp_var = np.zeros(nwin, dtype=np.bool)
+                        temp_var[0:ncut] = True
+                        jump_flag.append(temp_var)
+
+                        temp_var = np.zeros(nwin, dtype=data.time.dtype)
+                        temp_var[0:ncut] = data.time[aa:bb].copy()
+                        jump_time.append(temp_var)
+
+                        temp_var = np.zeros(nwin, dtype=auto.dtype)
+                        temp_var[0:ncut] = auto[ii, aa:bb].copy()
+                        jump_auto.append(temp_var)
 
 
-        output_file = os.path.join(config.output_dir, "%s_%s.h5" % (acq, output_suffix))
+            # Garbage collect
+            del data
+            gc.collect()
 
-        # Write to output file
-        with h5py.File(output_file, 'w') as handler:
+        # If we found any jumps, write them to a file.
+        if ncandidate > 0:
 
-            handler.attrs['files'] = data_files
-            handler.attrs['chan_id'] = ifeed
-            handler.attrs['freq'] = data.freq
+            output_file = os.path.join(config.output_dir, "%s_%s.h5" % (acq, output_suffix))
 
-            index_map = handler.create_group('index_map')
-            index_map.create_dataset('jump', data=np.arange(ncandidate))
-            index_map.create_dataset('window', data=np.arange(nwin))
+            mlog.info("Writing %d jumps to: %s" % (ncandidate, output_file))
 
-            ax = np.array(['jump'])
+            # Write to output file
+            with h5py.File(output_file, 'w') as handler:
 
-            dset = handler.create_dataset('freq', data=np.array(cfreq))
-            dset.attrs['axis'] = ax
+                handler.attrs['files'] = all_data_files
+                handler.attrs['chan_id'] = ifeed
+                handler.attrs['freq'] = all_freq
 
-            dset = handler.create_dataset('input', data=np.array(cinput))
-            dset.attrs['axis'] = ax
+                index_map = handler.create_group('index_map')
+                index_map.create_dataset('jump', data=np.arange(ncandidate))
+                index_map.create_dataset('window', data=np.arange(nwin))
 
-            dset = handler.create_dataset('time', data=np.array(ctime))
-            dset.attrs['axis'] = ax
+                ax = np.array(['jump'])
 
-            dset = handler.create_dataset('time_index', data=np.array(cindex))
-            dset.attrs['axis'] = ax
+                dset = handler.create_dataset('freq', data=np.array(cfreq))
+                dset.attrs['axis'] = ax
+
+                dset = handler.create_dataset('input', data=np.array(cinput))
+                dset.attrs['axis'] = ax
+
+                dset = handler.create_dataset('time', data=np.array(ctime))
+                dset.attrs['axis'] = ax
+
+                dset = handler.create_dataset('time_index', data=np.array(cindex))
+                dset.attrs['axis'] = ax
 
 
-            ax = np.array(['jump', 'window'])
+                ax = np.array(['jump', 'window'])
 
-            dset = handler.create_dataset('jump_flag', data=np.array(jump_flag))
-            dset.attrs['axis'] = ax
+                dset = handler.create_dataset('jump_flag', data=np.array(jump_flag))
+                dset.attrs['axis'] = ax
 
-            dset = handler.create_dataset('jump_time', data=np.array(jump_time))
-            dset.attrs['axis'] = ax
+                dset = handler.create_dataset('jump_time', data=np.array(jump_time))
+                dset.attrs['axis'] = ax
 
-            dset = handler.create_dataset('jump_auto', data=np.array(jump_auto))
-            dset.attrs['axis'] = ax
+                dset = handler.create_dataset('jump_auto', data=np.array(jump_auto))
+                dset.attrs['axis'] = ax
 
+        else:
+            mlog.info("No jumps found for %s acquisition." % acq)
 
 
 if __name__ == "__main__":
